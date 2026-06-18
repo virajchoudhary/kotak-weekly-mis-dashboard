@@ -33,7 +33,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .app-layout { min-height: 100vh; display: flex; align-items: flex-start; gap: 32px; padding: 32px 24px 64px; color: var(--text-primary); background: var(--bg-primary); transition: background .2s ease, color .2s ease; }
 .app-layout::after { content: ""; width: 144px; flex: 0 0 144px; }
 .sidebar { position: sticky; top: 32px; width: 144px; flex: 0 0 144px; display: flex; flex-direction: column; gap: 5px; padding-top: 12px; }
-.sidebar button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 42px; border: 0; border-left: 2px solid transparent; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; padding: 0 10px; background: transparent; color: var(--text-muted); cursor: pointer; text-align: left; font-size: 16px; font-weight: 500; transition: color .16s, background .16s; }
+.sidebar button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 42px; border: 0; border-left: 2px solid transparent; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; padding: 0 10px; background: transparent; color: var(--text-muted); cursor: pointer; text-align: left; font-size: 18px; font-weight: 500; transition: color .16s, background .16s; }
 .sidebar button:hover { color: var(--text-primary); background: var(--bg-hover); }
 .sidebar button.active { color: var(--text-primary); border-left-color: var(--accent); background: var(--bg-hover); }
 .main-content { width: min(1180px, calc(100% - 352px)); margin: 0 auto; }
@@ -104,7 +104,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .error-banner { border: 1px solid var(--border); border-left: 3px solid #ef4444; color: var(--text-primary); }
 .success-banner { border: 1px solid rgba(16,185,129,.28); border-left: 3px solid #10b981; color: var(--text-primary); }
 .table-scroll { max-height: 620px; overflow: auto; border-radius: 0 0 var(--radius-md) var(--radius-md); background: var(--table-bg); }
-.theory-table { width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.theory-table { width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
 .theory-table th { position: sticky; top: 0; z-index: 3; padding: 11px 10px; background: var(--table-header-bg); color: var(--table-header-text); border-right: 1px solid var(--divider); border-bottom: 1px solid var(--border-strong); text-align: right; white-space: nowrap; }
 .theory-table th:first-child { left: 0; z-index: 5; text-align: left; }
 .theory-table td { padding: 9px 10px; background: var(--table-cell-bg); color: var(--table-cell-text); border-right: 1px solid var(--divider); border-bottom: 1px solid var(--divider); text-align: right; white-space: nowrap; }
