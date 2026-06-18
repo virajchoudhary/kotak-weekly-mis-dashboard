@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+.venv/
+backend/data/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+.tmp_workbook_previews/
+.verification/
+.env
+frontend/.env
+
