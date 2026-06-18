@@ -547,7 +547,7 @@ export default function App() {
       <aside className="sidebar" aria-label="Dashboard sections">
         {tabs.map(([key, label, Icon]) => (
           <button key={key} className={activeTab === key ? 'active' : ''} onClick={() => setActiveTab(key)}>
-            <Icon size={20} /><span>{label}</span>
+            <Icon size={17} /><span>{label}</span>
           </button>
         ))}
       </aside>
