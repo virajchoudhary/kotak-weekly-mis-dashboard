@@ -38,9 +38,9 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .sidebar button.active { color: var(--text-primary); border-left-color: var(--accent); background: var(--bg-hover); }
 .main-content { width: min(1180px, calc(100% - 352px)); margin: 0 auto; }
 .app-header { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; margin-bottom: 24px; }
-.eyebrow { display: block; color: var(--text-muted); font-size: 11px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 7px; }
-.app-header h1 { margin: 0; font-size: clamp(30px, 4vw, 46px); letter-spacing: -.045em; line-height: 1; font-weight: 800; }
-.app-header p { margin: 10px 0 0; color: var(--text-secondary); font-size: 14px; }
+.eyebrow { display: block; color: var(--text-muted); font-size: 10px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 5px; }
+.app-header h1 { margin: 0; font-size: clamp(24px, 3.2vw, 32px); letter-spacing: -.03em; line-height: 1.1; font-weight: 800; }
+.app-header p { margin: 8px 0 0; color: var(--text-secondary); font-size: 13px; }
 .header-select { width: 238px; }
 .page-content { display: grid; gap: 20px; }
 .card { min-width: 0; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--card-shadow); overflow: visible; }
