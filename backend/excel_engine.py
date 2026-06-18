@@ -7,6 +7,8 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
+from openpyxl.worksheet.views import Selection
 
 from .constants import SUMMARY_METRICS
 from .mapping import is_fintech_row
@@ -19,9 +21,73 @@ EXPECTED_SHEETS = [
     "Brokerwise Data",
 ]
 
+AMOUNT_FMT = "#,##0.00"
+COUNT_FMT = "#,##0"
+SHARE_FMT = "0.00%"
+
+# Freeze cell per sheet (below each header band; left of the label columns). These
+# match the freezes the writers already apply and never cross a merged header range.
+SAFE_VIEW_FREEZE = {
+    "Summary - Banks, ND & RIA": "C3",  # rows 1-2 (group + column headers) + label cols A,B
+    "Summary - FINTECH": "C3",
+    "SIP Pivot": "C6",                  # rows 1-5 (labels + pivot header) + key cols A,B
+    "Brokerwise Data": "G3",            # rows 1-2 (group + column headers) + label cols A-F
+}
+
+
+def apply_safe_excel_view(ws, freeze_cell=None, active_cell="A1"):
+    """Make a worksheet open cleanly near the top-left with a safe freeze pane.
+
+    View-only: resets the saved scroll position, active/selected cell, zoom and view
+    mode, (re)applies the freeze, and unhides any header rows above the freeze line.
+    It never touches cell values, formulas, styles, merges, widths, or number formats.
+    Pass a ``freeze_cell`` that sits below every merged header range so the freeze
+    never splits a merged cell.
+    """
+    view = ws.sheet_view
+    view.view = "normal"            # not pageBreakPreview / pageLayout
+    view.topLeftCell = None          # clear any saved scroll position -> opens at A1
+    view.zoomScale = None            # 100%
+    view.zoomScaleNormal = None
+    view.tabSelected = False         # the active sheet is set by apply_safe_workbook_views
+    view.selection = [Selection(activeCell=active_cell, sqref=active_cell)]
+    if freeze_cell:
+        ws.freeze_panes = freeze_cell
+        freeze_row, _ = coordinate_to_tuple(freeze_cell)
+        for row in range(1, freeze_row):
+            dim = ws.row_dimensions.get(row)
+            if dim is not None and dim.hidden:
+                dim.hidden = False
+
+
+def apply_safe_workbook_views(workbook) -> None:
+    """Reset every generated sheet to a clean, header-visible view and open the
+    first sheet first. Safe to call after the workbook is fully built."""
+    for index, ws in enumerate(workbook.worksheets):
+        apply_safe_excel_view(ws, freeze_cell=SAFE_VIEW_FREEZE.get(ws.title.strip()))
+        ws.sheet_view.tabSelected = index == 0
+    workbook.active = 0
+
 
 def safe_ratio(numerator: float, denominator: float) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
+
+
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell_text(value: object) -> str:
+    """Neutralise spreadsheet formula/DDE injection in user-supplied text cells.
+
+    openpyxl turns a string beginning with ``=`` into a live formula, so a
+    malicious broker/ARN value (e.g. ``=cmd|'/c calc'!A1`` or ``=WEBSERVICE(...)``)
+    could execute or exfiltrate when an analyst opens the downloaded workbook.
+    Prefixing a literal apostrophe forces Excel to store it as plain text.
+    """
+    text = "" if value is None else str(value)
+    if text[:1] in _FORMULA_TRIGGERS:
+        return "'" + text
+    return text
 
 
 def build_summary_rows(
@@ -98,30 +164,50 @@ def _write_summary_sheet(worksheet, rows: list[dict]) -> None:
         (16, "cams_sip_book"),
     ]
     ms_columns = [(5, 3, 4), (8, 6, 7), (11, 9, 10), (14, 12, 13), (17, 15, 16)]
+    amount_columns = {3, 4, 6, 7, 9, 10, 15, 16}
+    count_columns = {12, 13}
     for row_number, record in enumerate(rows, start=first_row):
         worksheet.cell(row_number, 1, record["asset_class"])
         worksheet.cell(row_number, 2, record["sch_group"])
         for column, key in value_columns:
-            worksheet.cell(row_number, column, record[key])
+            cell = worksheet.cell(row_number, column, record[key])
+            if column in amount_columns:
+                cell.number_format = AMOUNT_FMT
+            elif column in count_columns:
+                cell.number_format = COUNT_FMT
         for ms_column, kotak_column, cams_column in ms_columns:
             worksheet.cell(
                 row_number,
                 ms_column,
                 f"=IFERROR(({get_column_letter(kotak_column)}{row_number}/{get_column_letter(cams_column)}{row_number}),0)",
             )
-            worksheet.cell(row_number, ms_column).number_format = "0%"
+            worksheet.cell(row_number, ms_column).number_format = SHARE_FMT
 
     worksheet.cell(total_row, 1, "Grand Total")
     for column, _ in value_columns:
         letter = get_column_letter(column)
-        worksheet.cell(total_row, column, f"=SUBTOTAL(9,{letter}{first_row}:{letter}{expected_last})")
+        cell = worksheet.cell(
+            total_row, column, f"=SUBTOTAL(9,{letter}{first_row}:{letter}{expected_last})"
+        )
+        if column in amount_columns:
+            cell.number_format = AMOUNT_FMT
+        elif column in count_columns:
+            cell.number_format = COUNT_FMT
     for ms_column, kotak_column, cams_column in ms_columns:
         worksheet.cell(
             total_row,
             ms_column,
             f"=IFERROR(({get_column_letter(kotak_column)}{total_row}/{get_column_letter(cams_column)}{total_row}),0)",
         )
-        worksheet.cell(total_row, ms_column).number_format = "0%"
+        worksheet.cell(total_row, ms_column).number_format = SHARE_FMT
+
+    for column in amount_columns:
+        worksheet.column_dimensions[get_column_letter(column)].width = 16
+    for column in count_columns:
+        worksheet.column_dimensions[get_column_letter(column)].width = 13
+    for ms_column, _, _ in ms_columns:
+        worksheet.column_dimensions[get_column_letter(ms_column)].width = 9
+
     worksheet.freeze_panes = "C3"
     worksheet.auto_filter.ref = f"A2:Q{expected_last}"
 
@@ -158,6 +244,9 @@ def _write_brokerwise_sheet(worksheet, frame: pd.DataFrame) -> None:
         "ms_sip_book",
     ]
     ms_positions = {9: (7, 8), 12: (10, 11), 15: (13, 14), 18: (16, 17), 21: (19, 20)}
+    amount_columns = {7, 8, 10, 11, 13, 14, 19, 20}
+    count_columns = {16, 17}
+    text_columns = {1, 2, 3, 4, 5, 6}
     for offset, record in enumerate(frame.to_dict(orient="records"), start=3):
         for column_number, key in enumerate(columns, start=1):
             cell = worksheet.cell(offset, column_number)
@@ -170,7 +259,12 @@ def _write_brokerwise_sheet(worksheet, frame: pd.DataFrame) -> None:
                 )
                 cell.number_format = "0.00%"
             else:
-                cell.value = record[key]
+                value = record[key]
+                cell.value = _safe_cell_text(value) if column_number in text_columns else value
+                if column_number in amount_columns:
+                    cell.number_format = AMOUNT_FMT
+                elif column_number in count_columns:
+                    cell.number_format = COUNT_FMT
 
     blank_row = 3 + len(frame)
     total_row = blank_row + 1
@@ -183,11 +277,15 @@ def _write_brokerwise_sheet(worksheet, frame: pd.DataFrame) -> None:
     last_data_row = blank_row - 1
     for column in (7, 8, 10, 11, 13, 14, 16, 17, 19, 20):
         letter = get_column_letter(column)
-        worksheet.cell(
+        cell = worksheet.cell(
             total_row,
             column,
             f"=SUBTOTAL(9,{letter}3:{letter}{last_data_row})" if len(frame) else 0,
         )
+        if column in amount_columns:
+            cell.number_format = AMOUNT_FMT
+        elif column in count_columns:
+            cell.number_format = COUNT_FMT
     for ms_column, (numerator, denominator) in ms_positions.items():
         worksheet.cell(
             total_row,
@@ -196,6 +294,15 @@ def _write_brokerwise_sheet(worksheet, frame: pd.DataFrame) -> None:
             f"{get_column_letter(denominator)}{total_row}),0)",
         )
         worksheet.cell(total_row, ms_column).number_format = "0.00%"
+
+    for column in amount_columns:
+        worksheet.column_dimensions[get_column_letter(column)].width = 16
+    for column in count_columns:
+        worksheet.column_dimensions[get_column_letter(column)].width = 13
+    for ms_column in ms_positions:
+        worksheet.column_dimensions[get_column_letter(ms_column)].width = 9
+    worksheet.column_dimensions[get_column_letter(4)].width = 30
+
     worksheet.freeze_panes = "G3"
     worksheet.auto_filter.ref = f"A2:U{last_data_row}" if len(frame) else "A2:U2"
 
@@ -240,12 +347,13 @@ def _rebuild_sip_sheet(workbook, frame: pd.DataFrame) -> None:
             record["cams_sip_count"],
         ]
         for column, value in enumerate(values, start=1):
-            cell = worksheet.cell(row_number, column, value)
+            safe_value = _safe_cell_text(value) if column <= 2 else value
+            cell = worksheet.cell(row_number, column, safe_value)
             cell.fill = blue
             cell.font = Font(name="Arial", size=9)
             cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
             if column > 2:
-                cell.number_format = "#,##0.00"
+                cell.number_format = COUNT_FMT
 
     total_row = 6 + len(pivot)
     worksheet.cell(total_row, 1, "Grand Total")
@@ -262,6 +370,8 @@ def _rebuild_sip_sheet(workbook, frame: pd.DataFrame) -> None:
     else:
         worksheet.cell(total_row, 3, 0)
         worksheet.cell(total_row, 4, 0)
+    worksheet.cell(total_row, 3).number_format = COUNT_FMT
+    worksheet.cell(total_row, 4).number_format = COUNT_FMT
     worksheet.auto_filter.ref = f"A5:D{max(total_row - 1, 5)}"
 
 
@@ -278,6 +388,8 @@ def generate_weekly_summary(
     _write_summary_sheet(_sheet_by_trimmed_name(workbook, EXPECTED_SHEETS[1]), fintech)
     _rebuild_sip_sheet(workbook, frame)
     _write_brokerwise_sheet(_sheet_by_trimmed_name(workbook, EXPECTED_SHEETS[3]), frame)
+    # Open every sheet at a clean, header-visible view and land on the first sheet.
+    apply_safe_workbook_views(workbook)
     workbook.calculation.fullCalcOnLoad = True
     workbook.calculation.forceFullCalc = True
     workbook.calculation.calcMode = "auto"

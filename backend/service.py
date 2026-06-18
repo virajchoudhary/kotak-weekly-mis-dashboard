@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import date
 from pathlib import Path
@@ -15,7 +16,11 @@ from .excel_engine import build_sip_pivot, build_summary_rows, generate_weekly_s
 from .mapping import is_fintech_row
 from .parser import parse_weekly_mis
 from .storage import StagedFiles, Storage
-from .validators import MISValidationError, validate_upload_metadata
+from .validators import (
+    MISValidationError,
+    validate_file_signature,
+    validate_upload_metadata,
+)
 
 
 class DuplicateUploadError(ValueError):
@@ -30,6 +35,78 @@ def _iso_week_label() -> str:
     today = date.today()
     year, week, _ = today.isocalendar()
     return f"{year}-W{week:02d}"
+
+
+SCOPE_NAMES = ("overall", "banks_nd_ria", "fintech", "unmapped_or_excluded")
+
+
+def compute_reconciliation(frame: pd.DataFrame, scheme_master: list[dict]) -> dict:
+    """Partition every brokerwise row into a single reporting scope and reconcile.
+
+    Scopes are mutually exclusive and exhaustive, so by construction:
+        overall == banks_nd_ria + fintech + unmapped_or_excluded
+    for every metric. ``unmapped_or_excluded`` captures FINTECH rows whose scheme
+    type is excluded from the FINTECH summary (the only leakage path) plus any
+    non-FINTECH row whose scheme type is not reported in Banks/ND/RIA.
+    """
+    metric_columns = [column for trio in SUMMARY_METRICS for column in trio[:2]]
+    banks_included = {row["asset_class"] for row in scheme_master if row["include_in_banks_nd_ria"]}
+    fintech_included = {row["asset_class"] for row in scheme_master if row["include_in_fintech"]}
+
+    counts = {name: 0 for name in SCOPE_NAMES}
+    sums = {name: {column: 0.0 for column in metric_columns} for name in SCOPE_NAMES}
+
+    if not frame.empty:
+        is_ft = frame.apply(is_fintech_row, axis=1)
+        in_banks = frame["asset_class"].isin(banks_included)
+        in_fintech = frame["asset_class"].isin(fintech_included)
+        masks = {
+            "banks_nd_ria": (~is_ft) & in_banks,
+            "fintech": is_ft & in_fintech,
+        }
+        masks["unmapped_or_excluded"] = ~(masks["banks_nd_ria"] | masks["fintech"])
+        for name, mask in masks.items():
+            subset = frame[mask]
+            counts[name] = int(mask.sum())
+            for column in metric_columns:
+                sums[name][column] = float(subset[column].sum()) if not subset.empty else 0.0
+        counts["overall"] = int(len(frame))
+        for column in metric_columns:
+            sums["overall"][column] = float(frame[column].sum())
+
+    totals = {}
+    for name in SCOPE_NAMES:
+        scope_total = dict(sums[name])
+        for kotak, cams, ms in SUMMARY_METRICS:
+            scope_total[ms] = safe_ratio(scope_total[kotak], scope_total[cams])
+        totals[name] = scope_total
+
+    reconciliation: dict[str, dict] = {}
+    reconciled = True
+    for column in metric_columns:
+        brokerwise = sums["overall"][column]
+        banks = sums["banks_nd_ria"][column]
+        fintech = sums["fintech"][column]
+        unmapped = sums["unmapped_or_excluded"][column]
+        difference = brokerwise - banks - fintech - unmapped
+        status = "reconciled" if abs(difference) < 0.01 else "mismatch"
+        if status != "reconciled":
+            reconciled = False
+        reconciliation[column] = {
+            "brokerwise_total": round(brokerwise, 2),
+            "banks_nd_ria_total": round(banks, 2),
+            "fintech_total": round(fintech, 2),
+            "unmapped_or_excluded_total": round(unmapped, 2),
+            "difference": round(difference, 2),
+            "status": status,
+        }
+
+    return {
+        "totals": totals,
+        "reconciliation": reconciliation,
+        "scope_counts": counts,
+        "reconciled": reconciled,
+    }
 
 
 class WeeklyMISService:
@@ -50,11 +127,12 @@ class WeeklyMISService:
         suffix = validate_upload_metadata(
             original_filename, len(content), self.settings.max_upload_bytes
         )
+        validate_file_signature(content, suffix)
         label = (week_label or "").strip() or _iso_week_label()
         if week_start_date and week_end_date and week_end_date < week_start_date:
             raise MISValidationError("Week end date cannot be before week start date.")
         file_hash = hashlib.sha256(content).hexdigest()
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             duplicate = conn.execute(
                 "SELECT id, week_label, file_hash FROM uploads WHERE file_hash=? OR week_label=?",
                 (file_hash, label),
@@ -78,6 +156,16 @@ class WeeklyMISService:
                 "row_count": len(parsed.frame),
                 "warnings": parsed.warnings,
             }
+            reconciliation = compute_reconciliation(parsed.frame, master)
+            validation["scope_counts"] = reconciliation["scope_counts"]
+            validation["reconciled"] = reconciliation["reconciled"]
+            validation["reconciliation"] = reconciliation["reconciliation"]
+            if reconciliation["scope_counts"].get("unmapped_or_excluded", 0) > 0:
+                validation["warnings"] = list(validation["warnings"]) + [
+                    f"{reconciliation['scope_counts']['unmapped_or_excluded']} FINTECH row(s) fall in scheme "
+                    "types excluded from the FINTECH summary; they are reported under Unmapped/Excluded and "
+                    "remain included in the reconciliation and Brokerwise totals."
+                ]
             generate_weekly_summary(
                 parsed.frame, master, self.settings.template_path, staged.generated_path
             )
@@ -156,7 +244,7 @@ class WeeklyMISService:
         }
 
     def list_uploads(self) -> list[dict]:
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT id, week_label, week_start_date, week_end_date, upload_date,
@@ -167,7 +255,7 @@ class WeeklyMISService:
         return [dict(row) for row in rows]
 
     def upload_details(self, upload_id: int) -> dict:
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             row = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
         if not row:
             raise UploadNotFoundError(f"Upload {upload_id} was not found.")
@@ -177,10 +265,14 @@ class WeeklyMISService:
 
     def download_path(self, upload_id: int) -> tuple[Path, str]:
         upload = self.upload_details(upload_id)
-        path = Path(upload["generated_file_path"])
-        if not path.is_file():
+        generated_dir = self.settings.generated_dir.resolve()
+        path = Path(upload["generated_file_path"]).resolve()
+        # Only ever serve files that physically live inside the controlled
+        # generated-output directory; never an arbitrary path from the DB.
+        if not path.is_file() or not path.is_relative_to(generated_dir):
             raise UploadNotFoundError(f"Generated file for upload {upload_id} is missing.")
-        return path, f"weekly_summary_{upload['week_label']}.xlsx"
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "-", upload["week_label"] or "").strip("-") or "week"
+        return path, f"weekly_summary_{slug}.xlsx"
 
     def delete_upload(self, upload_id: int) -> None:
         upload = self.upload_details(upload_id)
@@ -193,7 +285,7 @@ class WeeklyMISService:
         self.storage.cleanup(upload["raw_file_path"], upload["generated_file_path"])
 
     def _resolve_upload(self, upload_id: int | None, week_label: str | None) -> dict | None:
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             if upload_id is not None:
                 row = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
             elif week_label:
@@ -214,11 +306,15 @@ class WeeklyMISService:
             return {
                 "upload": None,
                 "kpis": {},
+                "totals": {},
+                "reconciliation": {},
+                "scope_counts": {},
+                "reconciled": True,
                 "charts": {"asset_class": [], "top_schemes": [], "sip": [], "trend": []},
                 "tables": {"banks_summary": [], "fintech_summary": [], "sip_pivot": [], "brokerwise": []},
                 "brokerwise_total": 0,
             }
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM weekly_brokerwise_rows WHERE upload_id=? ORDER BY id",
                 (upload["id"],),
@@ -228,8 +324,13 @@ class WeeklyMISService:
                 SELECT u.id, u.week_label, u.created_at,
                        SUM(r.kotak_aum) kotak_aum, SUM(r.cams_aum) cams_aum,
                        SUM(r.kotak_gross_sales) kotak_gross_sales,
+                       SUM(r.cams_gross_sales) cams_gross_sales,
                        SUM(r.kotak_net_sales) kotak_net_sales,
-                       SUM(r.kotak_sip_count) kotak_sip_count
+                       SUM(r.cams_net_sales) cams_net_sales,
+                       SUM(r.kotak_sip_count) kotak_sip_count,
+                       SUM(r.cams_sip_count) cams_sip_count,
+                       SUM(r.kotak_sip_book) kotak_sip_book,
+                       SUM(r.cams_sip_book) cams_sip_book
                 FROM uploads u JOIN weekly_brokerwise_rows r ON r.upload_id=u.id
                 WHERE u.status='finalized'
                 GROUP BY u.id ORDER BY u.created_at, u.id
@@ -239,15 +340,9 @@ class WeeklyMISService:
         frame = pd.DataFrame(records)
         master = self.database.fetch_scheme_master()
 
-        totals = {column: float(frame[column].sum()) for trio in SUMMARY_METRICS for column in trio[:2]}
-        kpis = {
-            **totals,
-            "ms_aum": safe_ratio(totals["kotak_aum"], totals["cams_aum"]),
-            "ms_gross_sales": safe_ratio(totals["kotak_gross_sales"], totals["cams_gross_sales"]),
-            "ms_net_sales": safe_ratio(totals["kotak_net_sales"], totals["cams_net_sales"]),
-            "ms_sip_count": safe_ratio(totals["kotak_sip_count"], totals["cams_sip_count"]),
-            "ms_sip_book": safe_ratio(totals["kotak_sip_book"], totals["cams_sip_book"]),
-        }
+        recon = compute_reconciliation(frame, master)
+        scope_totals = recon["totals"]
+        kpis = scope_totals["overall"]
         asset_class = (
             frame.groupby("sch_group")[["kotak_aum", "cams_aum", "kotak_gross_sales", "kotak_net_sales"]]
             .sum()
@@ -288,6 +383,10 @@ class WeeklyMISService:
         return {
             "upload": upload_public,
             "kpis": kpis,
+            "totals": scope_totals,
+            "reconciliation": recon["reconciliation"],
+            "scope_counts": recon["scope_counts"],
+            "reconciled": recon["reconciled"],
             "charts": {
                 "asset_class": asset_class,
                 "top_schemes": top_schemes,

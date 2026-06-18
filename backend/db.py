@@ -122,9 +122,24 @@ class Database:
         return conn
 
     def initialize(self) -> None:
-        with self.connect() as conn:
+        with self.connection() as conn:
             conn.executescript(SCHEMA)
             self._seed_reference_data(conn)
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        """Read/utility connection that is always committed and closed.
+
+        sqlite3's own ``with conn`` context manager commits but never closes the
+        connection, which leaks handles and can trigger 'database is locked' under
+        load. This wrapper guarantees the connection is closed.
+        """
+        conn = self.connect()
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
