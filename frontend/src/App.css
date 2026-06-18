@@ -33,7 +33,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .app-layout { min-height: 100vh; display: flex; align-items: flex-start; gap: 32px; padding: 32px 24px 64px; color: var(--text-primary); background: var(--bg-primary); transition: background .2s ease, color .2s ease; }
 .app-layout::after { content: ""; width: 144px; flex: 0 0 144px; }
 .sidebar { position: sticky; top: 32px; width: 144px; flex: 0 0 144px; display: flex; flex-direction: column; gap: 5px; padding-top: 12px; }
-.sidebar button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 42px; border: 0; border-left: 2px solid transparent; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; padding: 0 10px; background: transparent; color: var(--text-muted); cursor: pointer; text-align: left; font-size: 13px; transition: color .16s, background .16s; }
+.sidebar button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 42px; border: 0; border-left: 2px solid transparent; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; padding: 0 10px; background: transparent; color: var(--text-muted); cursor: pointer; text-align: left; font-size: 14.5px; transition: color .16s, background .16s; }
 .sidebar button:hover { color: var(--text-primary); background: var(--bg-hover); }
 .sidebar button.active { color: var(--text-primary); border-left-color: var(--accent); background: var(--bg-hover); }
 .main-content { width: min(1180px, calc(100% - 352px)); margin: 0 auto; }

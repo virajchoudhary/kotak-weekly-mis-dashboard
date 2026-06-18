@@ -371,7 +371,7 @@ function Overview({ data, loading, uploading, onUpload, action }) {
               <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 520, height: 270 }}>
                 <AreaChart data={charts.top_schemes} margin={{ top: 12, right: 12, left: 4, bottom: 4 }}>
                   <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
-                  <XAxis dataKey="name" hide />
+                  <XAxis dataKey="name" stroke="var(--chart-axis)" tickLine={false} axisLine={false} />
                   <YAxis stroke="var(--chart-axis)" tickLine={false} axisLine={false} tickFormatter={formatNumber} width={54} />
                   <Tooltip content={<ChartTooltip />} cursor={{ stroke: 'var(--chart-cursor-line)', strokeWidth: 1 }} />
                   <Area type="monotone" dataKey="kotak_aum" name="Kotak AUM" stroke="var(--chart-primary)" fill="var(--chart-fill)" strokeWidth={2} />
