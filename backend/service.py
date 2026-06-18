@@ -32,6 +32,78 @@ def _iso_week_label() -> str:
     return f"{year}-W{week:02d}"
 
 
+SCOPE_NAMES = ("overall", "banks_nd_ria", "fintech", "unmapped_or_excluded")
+
+
+def compute_reconciliation(frame: pd.DataFrame, scheme_master: list[dict]) -> dict:
+    """Partition every brokerwise row into a single reporting scope and reconcile.
+
+    Scopes are mutually exclusive and exhaustive, so by construction:
+        overall == banks_nd_ria + fintech + unmapped_or_excluded
+    for every metric. ``unmapped_or_excluded`` captures FINTECH rows whose scheme
+    type is excluded from the FINTECH summary (the only leakage path) plus any
+    non-FINTECH row whose scheme type is not reported in Banks/ND/RIA.
+    """
+    metric_columns = [column for trio in SUMMARY_METRICS for column in trio[:2]]
+    banks_included = {row["asset_class"] for row in scheme_master if row["include_in_banks_nd_ria"]}
+    fintech_included = {row["asset_class"] for row in scheme_master if row["include_in_fintech"]}
+
+    counts = {name: 0 for name in SCOPE_NAMES}
+    sums = {name: {column: 0.0 for column in metric_columns} for name in SCOPE_NAMES}
+
+    if not frame.empty:
+        is_ft = frame.apply(is_fintech_row, axis=1)
+        in_banks = frame["asset_class"].isin(banks_included)
+        in_fintech = frame["asset_class"].isin(fintech_included)
+        masks = {
+            "banks_nd_ria": (~is_ft) & in_banks,
+            "fintech": is_ft & in_fintech,
+        }
+        masks["unmapped_or_excluded"] = ~(masks["banks_nd_ria"] | masks["fintech"])
+        for name, mask in masks.items():
+            subset = frame[mask]
+            counts[name] = int(mask.sum())
+            for column in metric_columns:
+                sums[name][column] = float(subset[column].sum()) if not subset.empty else 0.0
+        counts["overall"] = int(len(frame))
+        for column in metric_columns:
+            sums["overall"][column] = float(frame[column].sum())
+
+    totals = {}
+    for name in SCOPE_NAMES:
+        scope_total = dict(sums[name])
+        for kotak, cams, ms in SUMMARY_METRICS:
+            scope_total[ms] = safe_ratio(scope_total[kotak], scope_total[cams])
+        totals[name] = scope_total
+
+    reconciliation: dict[str, dict] = {}
+    reconciled = True
+    for column in metric_columns:
+        brokerwise = sums["overall"][column]
+        banks = sums["banks_nd_ria"][column]
+        fintech = sums["fintech"][column]
+        unmapped = sums["unmapped_or_excluded"][column]
+        difference = brokerwise - banks - fintech - unmapped
+        status = "reconciled" if abs(difference) < 0.01 else "mismatch"
+        if status != "reconciled":
+            reconciled = False
+        reconciliation[column] = {
+            "brokerwise_total": round(brokerwise, 2),
+            "banks_nd_ria_total": round(banks, 2),
+            "fintech_total": round(fintech, 2),
+            "unmapped_or_excluded_total": round(unmapped, 2),
+            "difference": round(difference, 2),
+            "status": status,
+        }
+
+    return {
+        "totals": totals,
+        "reconciliation": reconciliation,
+        "scope_counts": counts,
+        "reconciled": reconciled,
+    }
+
+
 class WeeklyMISService:
     def __init__(self, settings: Settings, database: Database):
         self.settings = settings
@@ -78,6 +150,16 @@ class WeeklyMISService:
                 "row_count": len(parsed.frame),
                 "warnings": parsed.warnings,
             }
+            reconciliation = compute_reconciliation(parsed.frame, master)
+            validation["scope_counts"] = reconciliation["scope_counts"]
+            validation["reconciled"] = reconciliation["reconciled"]
+            validation["reconciliation"] = reconciliation["reconciliation"]
+            if reconciliation["scope_counts"].get("unmapped_or_excluded", 0) > 0:
+                validation["warnings"] = list(validation["warnings"]) + [
+                    f"{reconciliation['scope_counts']['unmapped_or_excluded']} FINTECH row(s) fall in scheme "
+                    "types excluded from the FINTECH summary; they are reported under Unmapped/Excluded and "
+                    "remain included in the reconciliation and Brokerwise totals."
+                ]
             generate_weekly_summary(
                 parsed.frame, master, self.settings.template_path, staged.generated_path
             )
@@ -214,6 +296,10 @@ class WeeklyMISService:
             return {
                 "upload": None,
                 "kpis": {},
+                "totals": {},
+                "reconciliation": {},
+                "scope_counts": {},
+                "reconciled": True,
                 "charts": {"asset_class": [], "top_schemes": [], "sip": [], "trend": []},
                 "tables": {"banks_summary": [], "fintech_summary": [], "sip_pivot": [], "brokerwise": []},
                 "brokerwise_total": 0,
@@ -228,8 +314,13 @@ class WeeklyMISService:
                 SELECT u.id, u.week_label, u.created_at,
                        SUM(r.kotak_aum) kotak_aum, SUM(r.cams_aum) cams_aum,
                        SUM(r.kotak_gross_sales) kotak_gross_sales,
+                       SUM(r.cams_gross_sales) cams_gross_sales,
                        SUM(r.kotak_net_sales) kotak_net_sales,
-                       SUM(r.kotak_sip_count) kotak_sip_count
+                       SUM(r.cams_net_sales) cams_net_sales,
+                       SUM(r.kotak_sip_count) kotak_sip_count,
+                       SUM(r.cams_sip_count) cams_sip_count,
+                       SUM(r.kotak_sip_book) kotak_sip_book,
+                       SUM(r.cams_sip_book) cams_sip_book
                 FROM uploads u JOIN weekly_brokerwise_rows r ON r.upload_id=u.id
                 WHERE u.status='finalized'
                 GROUP BY u.id ORDER BY u.created_at, u.id
@@ -239,15 +330,9 @@ class WeeklyMISService:
         frame = pd.DataFrame(records)
         master = self.database.fetch_scheme_master()
 
-        totals = {column: float(frame[column].sum()) for trio in SUMMARY_METRICS for column in trio[:2]}
-        kpis = {
-            **totals,
-            "ms_aum": safe_ratio(totals["kotak_aum"], totals["cams_aum"]),
-            "ms_gross_sales": safe_ratio(totals["kotak_gross_sales"], totals["cams_gross_sales"]),
-            "ms_net_sales": safe_ratio(totals["kotak_net_sales"], totals["cams_net_sales"]),
-            "ms_sip_count": safe_ratio(totals["kotak_sip_count"], totals["cams_sip_count"]),
-            "ms_sip_book": safe_ratio(totals["kotak_sip_book"], totals["cams_sip_book"]),
-        }
+        recon = compute_reconciliation(frame, master)
+        scope_totals = recon["totals"]
+        kpis = scope_totals["overall"]
         asset_class = (
             frame.groupby("sch_group")[["kotak_aum", "cams_aum", "kotak_gross_sales", "kotak_net_sales"]]
             .sum()
@@ -288,6 +373,10 @@ class WeeklyMISService:
         return {
             "upload": upload_public,
             "kpis": kpis,
+            "totals": scope_totals,
+            "reconciliation": recon["reconciliation"],
+            "scope_counts": recon["scope_counts"],
+            "reconciled": recon["reconciled"],
             "charts": {
                 "asset_class": asset_class,
                 "top_schemes": top_schemes,
