@@ -73,6 +73,23 @@ def safe_ratio(numerator: float, denominator: float) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
 
 
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell_text(value: object) -> str:
+    """Neutralise spreadsheet formula/DDE injection in user-supplied text cells.
+
+    openpyxl turns a string beginning with ``=`` into a live formula, so a
+    malicious broker/ARN value (e.g. ``=cmd|'/c calc'!A1`` or ``=WEBSERVICE(...)``)
+    could execute or exfiltrate when an analyst opens the downloaded workbook.
+    Prefixing a literal apostrophe forces Excel to store it as plain text.
+    """
+    text = "" if value is None else str(value)
+    if text[:1] in _FORMULA_TRIGGERS:
+        return "'" + text
+    return text
+
+
 def build_summary_rows(
     frame: pd.DataFrame, scheme_master: list[dict], fintech: bool
 ) -> list[dict]:
@@ -229,6 +246,7 @@ def _write_brokerwise_sheet(worksheet, frame: pd.DataFrame) -> None:
     ms_positions = {9: (7, 8), 12: (10, 11), 15: (13, 14), 18: (16, 17), 21: (19, 20)}
     amount_columns = {7, 8, 10, 11, 13, 14, 19, 20}
     count_columns = {16, 17}
+    text_columns = {1, 2, 3, 4, 5, 6}
     for offset, record in enumerate(frame.to_dict(orient="records"), start=3):
         for column_number, key in enumerate(columns, start=1):
             cell = worksheet.cell(offset, column_number)
@@ -241,7 +259,8 @@ def _write_brokerwise_sheet(worksheet, frame: pd.DataFrame) -> None:
                 )
                 cell.number_format = "0.00%"
             else:
-                cell.value = record[key]
+                value = record[key]
+                cell.value = _safe_cell_text(value) if column_number in text_columns else value
                 if column_number in amount_columns:
                     cell.number_format = AMOUNT_FMT
                 elif column_number in count_columns:
@@ -328,7 +347,8 @@ def _rebuild_sip_sheet(workbook, frame: pd.DataFrame) -> None:
             record["cams_sip_count"],
         ]
         for column, value in enumerate(values, start=1):
-            cell = worksheet.cell(row_number, column, value)
+            safe_value = _safe_cell_text(value) if column <= 2 else value
+            cell = worksheet.cell(row_number, column, safe_value)
             cell.fill = blue
             cell.font = Font(name="Arial", size=9)
             cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)

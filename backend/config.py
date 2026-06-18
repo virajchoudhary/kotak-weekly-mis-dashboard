@@ -8,6 +8,16 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
 
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
@@ -40,7 +50,7 @@ class Settings:
             data_dir=data_dir,
             database_path=database_path,
             template_path=template_path,
-            max_upload_bytes=int(os.getenv("WEEKLY_MIS_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)),
+            max_upload_bytes=_int_env("WEEKLY_MIS_MAX_UPLOAD_BYTES", 25 * 1024 * 1024),
             cors_origins=origins,
         )
 

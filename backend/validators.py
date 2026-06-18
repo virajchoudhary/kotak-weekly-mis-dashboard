@@ -33,6 +33,24 @@ def validate_upload_metadata(filename: str, size: int, max_size: int) -> str:
     return suffix
 
 
+def validate_file_signature(content: bytes, suffix: str) -> None:
+    """Reject files whose bytes do not match the claimed extension.
+
+    Defence in depth on top of the extension check: a renamed/forged binary is
+    rejected early with a clear message instead of failing deep in the parser.
+    CSV is plain text and has no reliable signature, so it is left to the parser.
+    """
+    head = content[:8]
+    if suffix == ".xlsx" and not head.startswith(b"PK\x03\x04"):
+        raise MISValidationError(
+            "This file is not a valid .xlsx workbook (its contents do not match the extension)."
+        )
+    if suffix == ".xls" and not head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        raise MISValidationError(
+            "This file is not a valid legacy .xls workbook (its contents do not match the extension)."
+        )
+
+
 def validate_headers(headers: Iterable[object]) -> dict[str, str]:
     headers = list(headers)
     normalized = [normalize_header(header) for header in headers]

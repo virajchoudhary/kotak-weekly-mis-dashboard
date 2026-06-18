@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import date
 from pathlib import Path
@@ -15,7 +16,11 @@ from .excel_engine import build_sip_pivot, build_summary_rows, generate_weekly_s
 from .mapping import is_fintech_row
 from .parser import parse_weekly_mis
 from .storage import StagedFiles, Storage
-from .validators import MISValidationError, validate_upload_metadata
+from .validators import (
+    MISValidationError,
+    validate_file_signature,
+    validate_upload_metadata,
+)
 
 
 class DuplicateUploadError(ValueError):
@@ -122,11 +127,12 @@ class WeeklyMISService:
         suffix = validate_upload_metadata(
             original_filename, len(content), self.settings.max_upload_bytes
         )
+        validate_file_signature(content, suffix)
         label = (week_label or "").strip() or _iso_week_label()
         if week_start_date and week_end_date and week_end_date < week_start_date:
             raise MISValidationError("Week end date cannot be before week start date.")
         file_hash = hashlib.sha256(content).hexdigest()
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             duplicate = conn.execute(
                 "SELECT id, week_label, file_hash FROM uploads WHERE file_hash=? OR week_label=?",
                 (file_hash, label),
@@ -238,7 +244,7 @@ class WeeklyMISService:
         }
 
     def list_uploads(self) -> list[dict]:
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT id, week_label, week_start_date, week_end_date, upload_date,
@@ -249,7 +255,7 @@ class WeeklyMISService:
         return [dict(row) for row in rows]
 
     def upload_details(self, upload_id: int) -> dict:
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             row = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
         if not row:
             raise UploadNotFoundError(f"Upload {upload_id} was not found.")
@@ -259,10 +265,14 @@ class WeeklyMISService:
 
     def download_path(self, upload_id: int) -> tuple[Path, str]:
         upload = self.upload_details(upload_id)
-        path = Path(upload["generated_file_path"])
-        if not path.is_file():
+        generated_dir = self.settings.generated_dir.resolve()
+        path = Path(upload["generated_file_path"]).resolve()
+        # Only ever serve files that physically live inside the controlled
+        # generated-output directory; never an arbitrary path from the DB.
+        if not path.is_file() or not path.is_relative_to(generated_dir):
             raise UploadNotFoundError(f"Generated file for upload {upload_id} is missing.")
-        return path, f"weekly_summary_{upload['week_label']}.xlsx"
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "-", upload["week_label"] or "").strip("-") or "week"
+        return path, f"weekly_summary_{slug}.xlsx"
 
     def delete_upload(self, upload_id: int) -> None:
         upload = self.upload_details(upload_id)
@@ -275,7 +285,7 @@ class WeeklyMISService:
         self.storage.cleanup(upload["raw_file_path"], upload["generated_file_path"])
 
     def _resolve_upload(self, upload_id: int | None, week_label: str | None) -> dict | None:
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             if upload_id is not None:
                 row = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
             elif week_label:
@@ -304,7 +314,7 @@ class WeeklyMISService:
                 "tables": {"banks_summary": [], "fintech_summary": [], "sip_pivot": [], "brokerwise": []},
                 "brokerwise_total": 0,
             }
-        with self.database.connect() as conn:
+        with self.database.connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM weekly_brokerwise_rows WHERE upload_id=? ORDER BY id",
                 (upload["id"],),

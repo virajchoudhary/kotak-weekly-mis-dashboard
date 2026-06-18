@@ -50,6 +50,13 @@ const EMPTY_DATA = {
   brokerwise_total: 0,
 }
 
+const normalizeDashboard = (payload) => ({
+  ...EMPTY_DATA,
+  ...(payload || {}),
+  charts: { ...EMPTY_DATA.charts, ...(payload?.charts || {}) },
+  tables: { ...EMPTY_DATA.tables, ...(payload?.tables || {}) },
+})
+
 const tabs = [
   ['overview', 'Overview', LayoutDashboard],
   ['banks', 'Banks / ND / RIA', BarChart3],
@@ -774,7 +781,7 @@ export default function App() {
     setError('')
     try {
       const query = uploadId && uploadId !== 'latest' ? `?upload_id=${uploadId}` : ''
-      setData(await api(`/api/dashboard-data${query}`))
+      setData(normalizeDashboard(await api(`/api/dashboard-data${query}`)))
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -805,7 +812,7 @@ export default function App() {
     if (weekLabel.trim()) body.append('week_label', weekLabel.trim())
     try {
       const result = await api('/api/uploads/weekly-mis', { method: 'POST', body })
-      setData(result.dashboard)
+      setData(normalizeDashboard(result.dashboard))
       setSelectedUpload(result.upload_id)
       setNotice(`${result.week_label} finalized: ${result.row_count} rows validated and stored.`)
       await loadUploads()

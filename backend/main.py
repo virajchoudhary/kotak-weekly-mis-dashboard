@@ -42,7 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/health", response_model=HealthResult)
     def health() -> dict:
         try:
-            with database.connect() as conn:
+            with database.connection() as conn:
                 conn.execute("SELECT 1").fetchone()
             db_status = "ok"
         except Exception:
