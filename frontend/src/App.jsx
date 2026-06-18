@@ -284,13 +284,13 @@ function DataTable({ rows, columns, empty = 'No rows available.' }) {
   )
 }
 
-function SummaryView({ title, subtitle, rows }) {
-  return <Section title={title} subtitle={subtitle}><DataTable rows={rows} columns={summaryColumns} /></Section>
+function SummaryView({ title, subtitle, rows, action }) {
+  return <Section title={title} subtitle={subtitle} action={action}><DataTable rows={rows} columns={summaryColumns} /></Section>
 }
 
-function SipView({ rows }) {
+function SipView({ rows, action }) {
   return (
-    <Section title="SIP Pivot" subtitle="Kotak and CAMS SIP counts grouped by ARN and broker.">
+    <Section title="SIP Pivot" subtitle="Kotak and CAMS SIP counts grouped by ARN and broker." action={action}>
       <DataTable rows={rows} columns={[
         ['arn_code', 'ARN code', 'text'], ['broker_name', 'Broker name', 'text'],
         ['kotak_sip_count', 'Kotak SIP count'], ['cams_sip_count', 'CAMS SIP count'],
@@ -299,7 +299,7 @@ function SipView({ rows }) {
   )
 }
 
-function BrokerwiseView({ rows, total }) {
+function BrokerwiseView({ rows, total, action }) {
   const [search, setSearch] = useState('')
   const filtered = useMemo(() => {
     const needle = search.trim().toLowerCase()
@@ -311,7 +311,12 @@ function BrokerwiseView({ rows, total }) {
     <Section
       title="Brokerwise Data"
       subtitle={`Showing ${filtered.length} of ${total} processed rows.`}
-      action={<label className="search-box"><Search size={16} /><input aria-label="Search brokerwise rows" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search…" /></label>}
+      action={
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <label className="search-box"><Search size={16} /><input aria-label="Search brokerwise rows" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search…" /></label>
+          {action}
+        </div>
+      }
     >
       <DataTable rows={filtered} columns={[
         ['category', 'Category', 'text'], ['sub_category', 'Sub-category', 'text'], ['arn_code', 'ARN code', 'text'],
@@ -324,7 +329,7 @@ function BrokerwiseView({ rows, total }) {
   )
 }
 
-function Overview({ data, loading, uploading, onUpload }) {
+function Overview({ data, loading, uploading, onUpload, action }) {
   const { kpis, charts } = data
   const metrics = [
     ['Kotak AUM', formatNumber(kpis.kotak_aum, 2), 'Portfolio assets'],
@@ -337,7 +342,7 @@ function Overview({ data, loading, uploading, onUpload }) {
   ]
   return (
     <>
-      <Section title="Upload weekly MIS" subtitle="Files are validated and the output workbook is generated before any data is committed.">
+      <Section title="Upload weekly MIS" subtitle="Files are validated and the output workbook is generated before any data is committed." action={action}>
         <UploadControl uploading={uploading} onUpload={onUpload} />
       </Section>
       <div className="metric-grid">
@@ -514,14 +519,20 @@ export default function App() {
     ...uploads.map((upload) => ({ value: upload.id, label: `${upload.week_label} · ${upload.row_count} rows` })),
   ]
 
+  const uploadSelector = (
+    <div className="header-select">
+      <GlassSelect ariaLabel="Select upload week" value={selectedUpload} options={uploadOptions} onChange={selectUpload} />
+    </div>
+  )
+
   const content = useMemo(() => {
-    if (activeTab === 'banks') return <SummaryView title="Summary - Banks, ND & RIA" subtitle="Template-ordered 45-scheme summary." rows={data.tables.banks_summary} />
-    if (activeTab === 'fintech') return <SummaryView title="Summary - FINTECH" subtitle="Template-ordered 42-scheme summary with exclusions applied." rows={data.tables.fintech_summary} />
-    if (activeTab === 'sip') return <SipView rows={data.tables.sip_pivot} />
-    if (activeTab === 'brokerwise') return <BrokerwiseView rows={data.tables.brokerwise} total={data.brokerwise_total} />
+    if (activeTab === 'banks') return <SummaryView title="Summary - Banks, ND & RIA" subtitle="Template-ordered 45-scheme summary." rows={data.tables.banks_summary} action={uploadSelector} />
+    if (activeTab === 'fintech') return <SummaryView title="Summary - FINTECH" subtitle="Template-ordered 42-scheme summary with exclusions applied." rows={data.tables.fintech_summary} action={uploadSelector} />
+    if (activeTab === 'sip') return <SipView rows={data.tables.sip_pivot} action={uploadSelector} />
+    if (activeTab === 'brokerwise') return <BrokerwiseView rows={data.tables.brokerwise} total={data.brokerwise_total} action={uploadSelector} />
     if (activeTab === 'archives') return <ArchivesView uploads={uploads} onSelect={selectUpload} onDelete={deleteUpload} />
-    return <Overview data={data} loading={loading && !data.upload} uploading={isUploading} onUpload={uploadFile} />
-  }, [activeTab, data, loading, isUploading, uploads])
+    return <Overview data={data} loading={loading && !data.upload} uploading={isUploading} onUpload={uploadFile} action={uploadSelector} />
+  }, [activeTab, data, loading, isUploading, uploads, selectedUpload, uploadOptions])
 
   return (
     <div className={`app-layout ${isDarkMode ? 'dark-theme' : 'light-theme'}`}>
@@ -547,7 +558,6 @@ export default function App() {
             <h1>Weekly MIS Dashboard</h1>
             <p>Validated brokerwise reporting, history, and template-matched Excel exports.</p>
           </div>
-          <div className="header-select"><GlassSelect ariaLabel="Select upload week" value={selectedUpload} options={uploadOptions} onChange={selectUpload} /></div>
         </header>
         {error && <div className="error-banner" role="alert">{error}</div>}
         {notice && <div className="success-banner" role="status">{notice}</div>}
