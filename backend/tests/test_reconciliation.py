@@ -73,7 +73,7 @@ def test_scopes_partition_rows_and_reconcile_to_zero(settings) -> None:
 
 
 def test_summary_table_totals_match_their_scope_totals(settings) -> None:
-    """The numbers the user sees in each summary tab equal the scope totals."""
+    """The primary summary ties to overall; FINTECH remains a separate breakout."""
     frame, master = _parsed(settings)
     recon = compute_reconciliation(frame, master)
     banks_rows = build_summary_rows(frame, master, fintech=False)
@@ -81,7 +81,7 @@ def test_summary_table_totals_match_their_scope_totals(settings) -> None:
     for column in METRIC_COLUMNS:
         banks_table_total = sum(row[column] for row in banks_rows)
         fintech_table_total = sum(row[column] for row in fintech_rows)
-        assert abs(banks_table_total - recon["totals"]["banks_nd_ria"][column]) < 0.01
+        assert abs(banks_table_total - recon["totals"]["overall"][column]) < 0.01
         assert abs(fintech_table_total - recon["totals"]["fintech"][column]) < 0.01
 
 
@@ -119,9 +119,7 @@ def _synthetic_row(category: str, asset_class: str, sch_group: str, kotak_aum: f
 
 
 def test_fintech_split_reconciles_with_nonzero_values(settings) -> None:
-    """Reproduces the reported scenario: the Banks/ND/RIA tab total is LESS than the
-    overall brokerwise total because FINTECH rows are reported separately, yet the
-    scopes still reconcile to zero difference."""
+    """The primary summary includes every row while FINTECH remains a breakout."""
     database = Database(settings.database_path)
     database.initialize()
     master = database.fetch_scheme_master()
@@ -148,14 +146,15 @@ def test_fintech_split_reconciles_with_nonzero_values(settings) -> None:
     assert aum["unmapped_or_excluded_total"] == 9000.0
     assert aum["difference"] == 0
     assert aum["status"] == "reconciled"
-    # the heart of the reported confusion: first-tab total < overall, but it reconciles
+    # Internal reporting scopes still reconcile independently.
     assert aum["banks_nd_ria_total"] < aum["brokerwise_total"]
     assert recon["reconciled"] is True
 
-    # the on-screen / Excel summary-tab grand totals equal their scope totals
+    # The primary summary now equals Brokerwise overall, including the FINTECH row
+    # whose scheme type is intentionally omitted from the FINTECH-only breakout.
     banks_rows = build_summary_rows(frame, master, fintech=False)
     fintech_rows = build_summary_rows(frame, master, fintech=True)
-    assert sum(row["kotak_aum"] for row in banks_rows) == 200000.0
+    assert sum(row["kotak_aum"] for row in banks_rows) == 259000.0
     assert sum(row["kotak_aum"] for row in fintech_rows) == 50000.0
 
 

@@ -12,6 +12,7 @@ import {
   PieChart,
   Rectangle,
   ResponsiveContainer,
+  Sector,
   Tooltip,
   XAxis,
   YAxis,
@@ -42,12 +43,12 @@ const EMPTY_DATA = {
   upload: null,
   kpis: {},
   totals: {},
-  reconciliation: {},
   scope_counts: {},
-  reconciled: true,
   charts: { asset_class: [], top_schemes: [], sip: [], trend: [] },
   tables: { banks_summary: [], fintech_summary: [], sip_pivot: [], brokerwise: [] },
   brokerwise_total: 0,
+  brokerwise_returned: 0,
+  brokerwise_truncated: false,
 }
 
 const normalizeDashboard = (payload) => ({
@@ -73,6 +74,10 @@ async function api(path, options) {
     const detail = body.detail || body
     const error = new Error(detail.message || `Request failed (${response.status})`)
     error.details = detail.errors || []
+    error.code = detail.code
+    error.existingUploadId = detail.existing_upload_id
+    error.canReplace = Boolean(detail.can_replace)
+    error.canContinue = Boolean(detail.can_continue)
     throw error
   }
   if (response.status === 204) return null
@@ -256,7 +261,33 @@ function MarketShareTooltip({ active, payload, label }) {
   )
 }
 
-function ShareDonut({ label, share }) {
+const renderActiveSlice = (props) => (
+  <Sector {...props} stroke="#fff" strokeWidth={2} strokeOpacity={0.85} />
+)
+
+function DonutTooltip({ active, label, kotak, cams, share }) {
+  if (!active) return null
+  return (
+    <div className="chart-tooltip">
+      <strong>{label}</strong>
+      <div className="tooltip-row">
+        <span><i style={{ background: 'var(--chart-primary)' }} />Kotak</span>
+        <b>{formatNumber(kotak, 2)}</b>
+      </div>
+      <div className="tooltip-row">
+        <span><i style={{ background: 'var(--chart-secondary)' }} />Industry (CAMS)</span>
+        <b>{formatNumber(cams, 2)}</b>
+      </div>
+      <div className="tooltip-row">
+        <span>Market share</span>
+        <b>{formatPercent(share)}</b>
+      </div>
+    </div>
+  )
+}
+
+function ShareDonut({ label, share, kotak, cams }) {
+  const [activeIndex, setActiveIndex] = useState(-1)
   const safe = Math.min(Math.max(Number(share) || 0, 0), 1)
   const pieData = [{ name: 'Kotak', value: safe }, { name: 'Industry', value: 1 - safe }]
   return (
@@ -264,13 +295,28 @@ function ShareDonut({ label, share }) {
       <div className="share-donut">
         <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 150, height: 150 }}>
           <PieChart>
-            <Pie data={pieData} dataKey="value" nameKey="name" innerRadius="62%" outerRadius="92%" startAngle={90} endAngle={-270} stroke="none" isAnimationActive={false}>
+            <Tooltip content={<DonutTooltip label={label} kotak={kotak} cams={cams} share={share} />} cursor={false} />
+            <Pie
+              data={pieData}
+              dataKey="value"
+              nameKey="name"
+              innerRadius="62%"
+              outerRadius="92%"
+              startAngle={90}
+              endAngle={-270}
+              stroke="none"
+              isAnimationActive={false}
+              activeIndex={activeIndex}
+              activeShape={renderActiveSlice}
+              onMouseEnter={(_, index) => setActiveIndex(index)}
+              onMouseLeave={() => setActiveIndex(-1)}
+            >
               <Cell fill="var(--chart-primary)" />
               <Cell fill="var(--chart-secondary)" />
             </Pie>
           </PieChart>
         </ResponsiveContainer>
-        <span className="share-value">{formatPercent(share)}</span>
+        <span className={`share-value ${activeIndex >= 0 ? 'dimmed' : ''}`}>{formatPercent(share)}</span>
       </div>
       <span className="share-caption">{label}</span>
     </div>
@@ -472,8 +518,11 @@ function SipView({ rows, action }) {
 }
 
 function BrokerwiseView({ rows, total, action }) {
+  const rowMessage = rows.length === total
+    ? `All ${total} uploaded rows across all scopes.`
+    : `Showing the first ${rows.length} of ${total} uploaded rows; the Excel download contains the complete dataset.`
   return (
-    <Section title="Overall Brokerwise Total" subtitle={`Every uploaded row across all scopes (Overall) · ${total} processed rows.`} action={action}>
+    <Section title="Overall Brokerwise Total" subtitle={rowMessage} action={action}>
       <DataTable rows={rows} showTotals searchable columns={[
         ['category', 'Category', 'text'], ['sub_category', 'Sub-category', 'text'], ['arn_code', 'ARN code', 'text'],
         ['broker_name', 'Broker', 'text'], ['sch_group', 'Scheme group', 'text'], ['asset_class', 'Asset class', 'text'],
@@ -522,71 +571,6 @@ function ScopeTabs({ value, onChange, counts }) {
         </button>
       ))}
     </div>
-  )
-}
-
-const reconMetrics = [
-  ['kotak_aum', 'Kotak AUM'],
-  ['cams_aum', 'CAMS AUM'],
-  ['kotak_gross_sales', 'Kotak Gross Sales'],
-  ['cams_gross_sales', 'CAMS Gross Sales'],
-  ['kotak_net_sales', 'Kotak Net Sales'],
-  ['cams_net_sales', 'CAMS Net Sales'],
-  ['kotak_sip_count', 'Kotak SIP Count'],
-  ['cams_sip_count', 'CAMS SIP Count'],
-  ['kotak_sip_book', 'Kotak SIP Book'],
-  ['cams_sip_book', 'CAMS SIP Book'],
-]
-
-function ReconciliationCard({ reconciliation, reconciled, loading }) {
-  const entries = reconciliation || {}
-  const hasData = Object.keys(entries).length > 0
-  return (
-    <Section
-      title="Reconciliation"
-      subtitle="Brokerwise = Banks/ND/RIA + FINTECH + Unmapped/Excluded. A metric is reconciled when the difference is 0."
-      action={hasData ? (
-        <span className={`recon-status ${reconciled ? 'ok' : 'bad'}`}>
-          {reconciled ? 'All metrics reconciled' : 'Mismatch detected'}
-        </span>
-      ) : null}
-    >
-      {!hasData ? (
-        <div className="empty-chart">{loading ? 'Loading…' : 'Upload a weekly MIS file to see reconciliation.'}</div>
-      ) : (
-        <div className="table-scroll">
-          <table className="theory-table recon-table">
-            <thead><tr>
-              <th className="text-cell">Metric</th>
-              <th>Brokerwise total</th>
-              <th>Banks/ND/RIA</th>
-              <th>FINTECH</th>
-              <th>Unmapped/Excluded</th>
-              <th>Difference</th>
-              <th>Status</th>
-            </tr></thead>
-            <tbody>
-              {reconMetrics.map(([key, label]) => {
-                const entry = entries[key]
-                if (!entry) return null
-                const ok = entry.status === 'reconciled'
-                return (
-                  <tr key={key}>
-                    <td className="text-cell">{label}</td>
-                    <td>{formatNumber(entry.brokerwise_total, 2)}</td>
-                    <td>{formatNumber(entry.banks_nd_ria_total, 2)}</td>
-                    <td>{formatNumber(entry.fintech_total, 2)}</td>
-                    <td>{formatNumber(entry.unmapped_or_excluded_total, 2)}</td>
-                    <td className={ok ? '' : 'neg'}>{formatNumber(entry.difference, 2)}</td>
-                    <td><span className={`recon-badge ${ok ? 'ok' : 'bad'}`}>{ok ? 'Reconciled' : 'Mismatch'}</span></td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </Section>
   )
 }
 
@@ -643,17 +627,16 @@ function Overview({ data, loading, uploading, onUpload, action }) {
       </div>
       {!isOverall && (
         <div className="scope-note">
-          Showing <strong>{scopeLabels[scope]}</strong> totals — a subset of the overall brokerwise total. Week-over-week deltas are shown for the Overall scope only. See Reconciliation below.
+          Showing <strong>{scopeLabels[scope]}</strong> totals — a subset of the overall brokerwise total. Overall combines Banks/ND/RIA and FINTECH; week-over-week deltas are shown for Overall only.
         </div>
       )}
-      <ReconciliationCard reconciliation={data.reconciliation} reconciled={data.reconciled} loading={loading} />
       <Section title="Market share — Kotak vs industry" subtitle={`Kotak share of each industry metric · ${scopeLabels[scope]}`}>
         {!hasKpis ? <div className="chart-wrap"><EmptyChart loading={loading} /></div> : (
           <div className="share-grid">
-            <ShareDonut label="AUM" share={scopeTotals.ms_aum} />
-            <ShareDonut label="Gross sales" share={scopeTotals.ms_gross_sales} />
-            <ShareDonut label="Net sales" share={scopeTotals.ms_net_sales} />
-            <ShareDonut label="SIP count" share={scopeTotals.ms_sip_count} />
+            <ShareDonut label="AUM" share={scopeTotals.ms_aum} kotak={scopeTotals.kotak_aum} cams={scopeTotals.cams_aum} />
+            <ShareDonut label="Gross sales" share={scopeTotals.ms_gross_sales} kotak={scopeTotals.kotak_gross_sales} cams={scopeTotals.cams_gross_sales} />
+            <ShareDonut label="Net sales" share={scopeTotals.ms_net_sales} kotak={scopeTotals.kotak_net_sales} cams={scopeTotals.cams_net_sales} />
+            <ShareDonut label="SIP count" share={scopeTotals.ms_sip_count} kotak={scopeTotals.kotak_sip_count} cams={scopeTotals.cams_sip_count} />
           </div>
         )}
       </Section>
@@ -807,14 +790,40 @@ export default function App() {
     setIsUploading(true)
     setError('')
     setNotice('')
-    const body = new FormData()
-    body.append('file', file)
-    if (weekLabel.trim()) body.append('week_label', weekLabel.trim())
     try {
-      const result = await api('/api/uploads/weekly-mis', { method: 'POST', body })
+      const submit = async ({ replaceExisting = false, allowDuplicateData = false } = {}) => {
+        const body = new FormData()
+        body.append('file', file)
+        if (weekLabel.trim()) body.append('week_label', weekLabel.trim())
+        if (replaceExisting) body.append('replace_existing', 'true')
+        if (allowDuplicateData) body.append('allow_duplicate_data', 'true')
+        return api('/api/uploads/weekly-mis', { method: 'POST', body })
+      }
+      let result
+      try {
+        result = await submit()
+      } catch (requestError) {
+        if (requestError.canReplace) {
+          const label = weekLabel.trim() || 'the current ISO week'
+          const confirmed = window.confirm(
+            `${label} already exists. Replace it with this corrected file? The previous upload will be removed after the new file passes every validation.`,
+          )
+          if (!confirmed) throw requestError
+          result = await submit({ replaceExisting: true })
+        } else if (requestError.canContinue) {
+          const confirmed = window.confirm(
+            'This upload contains the same normalized business rows as an earlier week. Continue only if unchanged figures are genuinely correct for this new week.',
+          )
+          if (!confirmed) throw requestError
+          result = await submit({ allowDuplicateData: true })
+        } else {
+          throw requestError
+        }
+      }
       setData(normalizeDashboard(result.dashboard))
       setSelectedUpload(result.upload_id)
-      setNotice(`${result.week_label} finalized: ${result.row_count} rows validated and stored.`)
+      const action = result.status === 'replaced' ? 'replaced safely' : 'finalized'
+      setNotice(`${result.week_label} ${action}: ${result.row_count} rows validated and stored.`)
       await loadUploads()
     } catch (requestError) {
       const firstDetail = requestError.details?.[0]
@@ -850,8 +859,8 @@ export default function App() {
   )
 
   const content = useMemo(() => {
-    if (activeTab === 'banks') return <SummaryView title="Banks/ND/RIA Summary" subtitle="Banks/ND/RIA scope only — FINTECH is reported separately, so these totals exclude FINTECH. Full breakdown under Reconciliation on the Overview tab." rows={data.tables.banks_summary} action={uploadSelector} />
-    if (activeTab === 'fintech') return <SummaryView title="FINTECH Summary" subtitle="FINTECH scope only — 42-scheme summary with 3 excluded scheme types. Banks/ND/RIA + FINTECH + Unmapped/Excluded = Overall Brokerwise total." rows={data.tables.fintech_summary} action={uploadSelector} />
+    if (activeTab === 'banks') return <SummaryView title="Banks/ND/RIA Summary" subtitle="Includes FINTECH in the asset-wise totals so the grand total matches overall Brokerwise Data. FINTECH remains available as a separate breakout." rows={data.tables.banks_summary} action={uploadSelector} />
+    if (activeTab === 'fintech') return <SummaryView title="FINTECH Summary" subtitle="FINTECH scope only — 42-scheme summary with 3 excluded scheme types." rows={data.tables.fintech_summary} action={uploadSelector} />
     if (activeTab === 'sip') return <SipView rows={data.tables.sip_pivot} action={uploadSelector} />
     if (activeTab === 'brokerwise') return <BrokerwiseView rows={data.tables.brokerwise} total={data.brokerwise_total} action={uploadSelector} />
     if (activeTab === 'archives') return <ArchivesView uploads={uploads} onSelect={selectUpload} onDelete={deleteUpload} />

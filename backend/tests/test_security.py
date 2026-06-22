@@ -124,6 +124,18 @@ def test_download_nonexistent_upload_is_404(client) -> None:
     assert client.get("/api/download/999999").status_code == 404
 
 
+def test_upload_details_do_not_expose_internal_paths_or_hashes(client) -> None:
+    row = "ARN-1,Test Broker,BANKS,-,Equity,Large Cap Fund,100,200,10,20,5,10,3,6,1000,2000"
+    content = (CSV_HEADER + "\n" + row + "\n").encode("utf-8")
+    created = _post(client, "weekly.csv", content, "text/csv", "safe-details")
+    upload_id = created.json()["upload_id"]
+    detail = client.get(f"/api/uploads/{upload_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    for private_key in ("raw_file_path", "generated_file_path", "file_hash", "data_hash"):
+        assert private_key not in payload
+
+
 def test_generated_workbook_still_has_exactly_four_sheets(settings, tmp_path: Path) -> None:
     database = Database(settings.database_path)
     database.initialize()
