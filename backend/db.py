@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     upload_date TEXT NOT NULL,
     original_filename TEXT NOT NULL,
     file_hash TEXT NOT NULL UNIQUE,
+    data_hash TEXT,
     raw_file_path TEXT NOT NULL,
     generated_file_path TEXT NOT NULL,
     row_count INTEGER NOT NULL,
@@ -124,6 +125,10 @@ class Database:
     def initialize(self) -> None:
         with self.connection() as conn:
             conn.executescript(SCHEMA)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(uploads)")}
+            if "data_hash" not in columns:
+                conn.execute("ALTER TABLE uploads ADD COLUMN data_hash TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_uploads_data_hash ON uploads(data_hash)")
             self._seed_reference_data(conn)
 
     @contextmanager
@@ -222,4 +227,3 @@ class Database:
                 "SELECT * FROM mapping_rules WHERE active=1 ORDER BY priority, id"
             ).fetchall()
         return [dict(row) for row in rows]
-

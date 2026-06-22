@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import Settings
-from .constants import DB_ROW_COLUMNS, SUMMARY_METRICS
+from .constants import DB_ROW_COLUMNS, NUMERIC_COLUMNS, SUMMARY_METRICS, TEXT_COLUMNS
 from .db import Database, utc_now
 from .excel_engine import build_sip_pivot, build_summary_rows, generate_weekly_summary, safe_ratio
 from .mapping import is_fintech_row
@@ -24,7 +24,20 @@ from .validators import (
 
 
 class DuplicateUploadError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        existing_upload_id: int,
+        can_replace: bool = False,
+        can_continue: bool = False,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.existing_upload_id = existing_upload_id
+        self.can_replace = can_replace
+        self.can_continue = can_continue
 
 
 class UploadNotFoundError(LookupError):
@@ -35,6 +48,24 @@ def _iso_week_label() -> str:
     today = date.today()
     year, week, _ = today.isocalendar()
     return f"{year}-W{week:02d}"
+
+
+def canonical_data_hash(frame: pd.DataFrame) -> str:
+    """Hash normalized business rows, independent of file metadata and row order."""
+    columns = TEXT_COLUMNS + NUMERIC_COLUMNS
+    encoded_rows: list[str] = []
+    for record in frame[columns].to_dict(orient="records"):
+        normalized = {}
+        for column in TEXT_COLUMNS:
+            normalized[column] = str(record[column]).strip()
+        for column in NUMERIC_COLUMNS:
+            value = float(record[column])
+            normalized[column] = 0.0 if value == 0 else value
+        encoded_rows.append(
+            json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+    payload = "\n".join(sorted(encoded_rows)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 SCOPE_NAMES = ("overall", "banks_nd_ria", "fintech", "unmapped_or_excluded")
@@ -123,6 +154,8 @@ class WeeklyMISService:
         week_label: str | None,
         week_start_date: date | None,
         week_end_date: date | None,
+        replace_existing: bool = False,
+        allow_duplicate_data: bool = False,
     ) -> dict:
         suffix = validate_upload_metadata(
             original_filename, len(content), self.settings.max_upload_bytes
@@ -133,14 +166,25 @@ class WeeklyMISService:
             raise MISValidationError("Week end date cannot be before week start date.")
         file_hash = hashlib.sha256(content).hexdigest()
         with self.database.connection() as conn:
-            duplicate = conn.execute(
-                "SELECT id, week_label, file_hash FROM uploads WHERE file_hash=? OR week_label=?",
-                (file_hash, label),
+            duplicate_file = conn.execute(
+                "SELECT id FROM uploads WHERE file_hash=?", (file_hash,)
             ).fetchone()
-        if duplicate:
-            reason = "file" if duplicate["file_hash"] == file_hash else "week label"
+            existing_week = conn.execute(
+                "SELECT id, raw_file_path, generated_file_path FROM uploads WHERE week_label=?",
+                (label,),
+            ).fetchone()
+        if duplicate_file:
             raise DuplicateUploadError(
-                f"A successful upload already exists for this {reason} (upload {duplicate['id']})."
+                f"This exact file already exists as upload {duplicate_file['id']}.",
+                reason="file_exists",
+                existing_upload_id=int(duplicate_file["id"]),
+            )
+        if existing_week and not replace_existing:
+            raise DuplicateUploadError(
+                f"Week {label} already exists as upload {existing_week['id']}. Replace it only if this is a corrected file.",
+                reason="week_exists",
+                existing_upload_id=int(existing_week["id"]),
+                can_replace=True,
             )
 
         staged = self.storage.stage_upload(content, suffix)
@@ -149,6 +193,33 @@ class WeeklyMISService:
             master = self.database.fetch_scheme_master()
             rules = self.database.fetch_mapping_rules()
             parsed = parse_weekly_mis(staged.raw_path, master, rules)
+            data_hash = canonical_data_hash(parsed.frame)
+            with self.database.connection() as conn:
+                # Backfill fingerprints for uploads created before semantic duplicate
+                # detection was introduced.
+                legacy = conn.execute("SELECT id FROM uploads WHERE data_hash IS NULL").fetchall()
+                for row in legacy:
+                    stored = conn.execute(
+                        f"SELECT {','.join(TEXT_COLUMNS + NUMERIC_COLUMNS)} "
+                        "FROM weekly_brokerwise_rows WHERE upload_id=?",
+                        (row["id"],),
+                    ).fetchall()
+                    if stored:
+                        stored_hash = canonical_data_hash(pd.DataFrame([dict(value) for value in stored]))
+                        conn.execute(
+                            "UPDATE uploads SET data_hash=? WHERE id=?", (stored_hash, row["id"])
+                        )
+                duplicate_data = conn.execute(
+                    "SELECT id, week_label FROM uploads WHERE data_hash=?", (data_hash,)
+                ).fetchone()
+            if duplicate_data and not allow_duplicate_data:
+                can_continue = duplicate_data["week_label"] != label
+                raise DuplicateUploadError(
+                    f"The uploaded rows are unchanged from upload {duplicate_data['id']} ({duplicate_data['week_label']}).",
+                    reason="data_exists",
+                    existing_upload_id=int(duplicate_data["id"]),
+                    can_continue=can_continue,
+                )
             validation = {
                 "valid": True,
                 "source_sheet": parsed.source_sheet,
@@ -170,15 +241,53 @@ class WeeklyMISService:
                 parsed.frame, master, self.settings.template_path, staged.generated_path
             )
             now = utc_now()
+            replaced_upload: dict | None = None
             with self.database.transaction() as conn:
+                # Repeat all uniqueness checks under the write lock to close races
+                # between concurrent requests.
+                duplicate_file = conn.execute(
+                    "SELECT id FROM uploads WHERE file_hash=?", (file_hash,)
+                ).fetchone()
+                if duplicate_file:
+                    raise DuplicateUploadError(
+                        f"This exact file already exists as upload {duplicate_file['id']}.",
+                        reason="file_exists",
+                        existing_upload_id=int(duplicate_file["id"]),
+                    )
+                duplicate_data = conn.execute(
+                    "SELECT id, week_label FROM uploads WHERE data_hash=?", (data_hash,)
+                ).fetchone()
+                if duplicate_data and not allow_duplicate_data:
+                    can_continue = duplicate_data["week_label"] != label
+                    raise DuplicateUploadError(
+                        f"The uploaded rows are unchanged from upload {duplicate_data['id']} ({duplicate_data['week_label']}).",
+                        reason="data_exists",
+                        existing_upload_id=int(duplicate_data["id"]),
+                        can_continue=can_continue,
+                    )
+                current_week = conn.execute(
+                    "SELECT id, raw_file_path, generated_file_path, file_hash, data_hash "
+                    "FROM uploads WHERE week_label=?",
+                    (label,),
+                ).fetchone()
+                if current_week:
+                    if not replace_existing:
+                        raise DuplicateUploadError(
+                            f"Week {label} already exists as upload {current_week['id']}.",
+                            reason="week_exists",
+                            existing_upload_id=int(current_week["id"]),
+                            can_replace=True,
+                        )
+                    replaced_upload = dict(current_week)
+                    conn.execute("DELETE FROM uploads WHERE id=?", (current_week["id"],))
                 cursor = conn.execute(
                     """
                     INSERT INTO uploads (
                         week_label, week_start_date, week_end_date, upload_date,
-                        original_filename, file_hash, raw_file_path,
+                        original_filename, file_hash, data_hash, raw_file_path,
                         generated_file_path, row_count, status,
                         validation_summary_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, 'finalized', ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, 'finalized', ?, ?, ?)
                     """,
                     (
                         label,
@@ -187,6 +296,7 @@ class WeeklyMISService:
                         now,
                         Path(original_filename).name,
                         file_hash,
+                        data_hash,
                         len(parsed.frame),
                         json.dumps(validation),
                         now,
@@ -223,10 +333,34 @@ class WeeklyMISService:
                     "INSERT INTO audit_log (action, upload_id, details_json, created_at) VALUES ('upload_finalized', ?, ?, ?)",
                     (upload_id, json.dumps({"row_count": len(rows), "file_hash": file_hash}), now),
                 )
+                if replaced_upload:
+                    conn.execute(
+                        "INSERT INTO audit_log (action, upload_id, details_json, created_at) "
+                        "VALUES ('upload_replaced', ?, ?, ?)",
+                        (
+                            upload_id,
+                            json.dumps(
+                                {
+                                    "replaced_upload_id": replaced_upload["id"],
+                                    "previous_file_hash": replaced_upload["file_hash"],
+                                    "previous_data_hash": replaced_upload["data_hash"],
+                                }
+                            ),
+                            now,
+                        ),
+                    )
+            if replaced_upload:
+                self.storage.cleanup(
+                    replaced_upload["raw_file_path"], replaced_upload["generated_file_path"]
+                )
         except sqlite3.IntegrityError as exc:
             if finalized:
                 self.storage.cleanup(*finalized)
-            raise DuplicateUploadError("This file or week label has already been uploaded.") from exc
+            raise DuplicateUploadError(
+                "This file, its normalized data, or its week label already exists.",
+                reason="duplicate",
+                existing_upload_id=0,
+            ) from exc
         except Exception:
             if finalized:
                 self.storage.cleanup(*finalized)
@@ -236,7 +370,7 @@ class WeeklyMISService:
 
         return {
             "upload_id": upload_id,
-            "status": "finalized",
+            "status": "replaced" if replaced_upload else "finalized",
             "week_label": label,
             "row_count": len(parsed.frame),
             "validation": validation,
@@ -254,17 +388,34 @@ class WeeklyMISService:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def upload_details(self, upload_id: int) -> dict:
+    def _upload_record(self, upload_id: int) -> dict:
         with self.database.connection() as conn:
             row = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
         if not row:
             raise UploadNotFoundError(f"Upload {upload_id} was not found.")
-        result = dict(row)
-        result["validation_summary"] = json.loads(result.pop("validation_summary_json"))
+        return dict(row)
+
+    def upload_details(self, upload_id: int) -> dict:
+        """Return audit-safe metadata without exposing server paths or hashes."""
+        row = self._upload_record(upload_id)
+        public_keys = (
+            "id",
+            "week_label",
+            "week_start_date",
+            "week_end_date",
+            "upload_date",
+            "original_filename",
+            "row_count",
+            "status",
+            "created_at",
+            "updated_at",
+        )
+        result = {key: row[key] for key in public_keys}
+        result["validation_summary"] = json.loads(row["validation_summary_json"])
         return result
 
     def download_path(self, upload_id: int) -> tuple[Path, str]:
-        upload = self.upload_details(upload_id)
+        upload = self._upload_record(upload_id)
         generated_dir = self.settings.generated_dir.resolve()
         path = Path(upload["generated_file_path"]).resolve()
         # Only ever serve files that physically live inside the controlled
@@ -275,7 +426,7 @@ class WeeklyMISService:
         return path, f"weekly_summary_{slug}.xlsx"
 
     def delete_upload(self, upload_id: int) -> None:
-        upload = self.upload_details(upload_id)
+        upload = self._upload_record(upload_id)
         with self.database.transaction() as conn:
             conn.execute("DELETE FROM uploads WHERE id=?", (upload_id,))
             conn.execute(
@@ -299,7 +450,7 @@ class WeeklyMISService:
         return dict(row) if row else None
 
     def dashboard(
-        self, upload_id: int | None = None, week_label: str | None = None, limit: int = 500
+        self, upload_id: int | None = None, week_label: str | None = None, limit: int = 5000
     ) -> dict:
         upload = self._resolve_upload(upload_id, week_label)
         if not upload:
@@ -313,6 +464,8 @@ class WeeklyMISService:
                 "charts": {"asset_class": [], "top_schemes": [], "sip": [], "trend": []},
                 "tables": {"banks_summary": [], "fintech_summary": [], "sip_pivot": [], "brokerwise": []},
                 "brokerwise_total": 0,
+                "brokerwise_returned": 0,
+                "brokerwise_truncated": False,
             }
         with self.database.connection() as conn:
             rows = conn.execute(
@@ -380,6 +533,7 @@ class WeeklyMISService:
             )
         }
         broker_columns = [column for column in DB_ROW_COLUMNS if column in frame.columns]
+        brokerwise_rows = frame[broker_columns].head(max(1, min(limit, 5000))).to_dict(orient="records")
         return {
             "upload": upload_public,
             "kpis": kpis,
@@ -397,8 +551,9 @@ class WeeklyMISService:
                 "banks_summary": build_summary_rows(frame, master, fintech=False),
                 "fintech_summary": build_summary_rows(frame, master, fintech=True),
                 "sip_pivot": build_sip_pivot(frame),
-                "brokerwise": frame[broker_columns].head(max(1, min(limit, 5000))).to_dict(orient="records"),
+                "brokerwise": brokerwise_rows,
             },
             "brokerwise_total": len(frame),
+            "brokerwise_returned": len(brokerwise_rows),
+            "brokerwise_truncated": len(brokerwise_rows) < len(frame),
         }
-

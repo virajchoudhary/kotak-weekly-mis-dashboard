@@ -55,6 +55,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         week_label: str | None = Form(None),
         week_start_date: date | None = Form(None),
         week_end_date: date | None = Form(None),
+        replace_existing: bool = Form(False),
+        allow_duplicate_data: bool = Form(False),
     ) -> dict:
         content = await file.read(settings.max_upload_bytes + 1)
         try:
@@ -64,6 +66,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 week_label=week_label,
                 week_start_date=week_start_date,
                 week_end_date=week_end_date,
+                replace_existing=replace_existing,
+                allow_duplicate_data=allow_duplicate_data,
             )
         except MISValidationError as exc:
             raise HTTPException(
@@ -71,7 +75,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail={"message": exc.message, "errors": exc.errors},
             ) from exc
         except DuplicateUploadError as exc:
-            raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "code": exc.reason,
+                    "existing_upload_id": exc.existing_upload_id,
+                    "can_replace": exc.can_replace,
+                    "can_continue": exc.can_continue,
+                },
+            ) from exc
         except Exception as exc:
             logger.exception("Weekly MIS upload failed")
             raise HTTPException(
@@ -83,7 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def dashboard_data(
         upload_id: int | None = Query(None, ge=1),
         week_label: str | None = None,
-        limit: int = Query(500, ge=1, le=5000),
+        limit: int = Query(5000, ge=1, le=5000),
     ) -> dict:
         try:
             return service.dashboard(upload_id=upload_id, week_label=week_label, limit=limit)
@@ -127,4 +140,3 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 app = create_app()
-

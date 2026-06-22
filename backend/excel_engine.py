@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from copy import copy
+import math
+import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.cell import coordinate_to_tuple
 from openpyxl.worksheet.views import Selection
 
 from .constants import SUMMARY_METRICS
@@ -15,7 +21,7 @@ from .mapping import is_fintech_row
 
 
 EXPECTED_SHEETS = [
-    "Summary - Banks, ND & RIA",
+    "Summary - Banks, ND & RIA ",
     "Summary - FINTECH",
     "SIP Pivot",
     "Brokerwise Data",
@@ -24,25 +30,14 @@ EXPECTED_SHEETS = [
 AMOUNT_FMT = "#,##0.00"
 COUNT_FMT = "#,##0"
 SHARE_FMT = "0.00%"
+FORMULA_ERRORS = {"#REF!", "#DIV/0!", "#VALUE!", "#N/A", "#NAME?"}
 
-# Freeze cell per sheet (below each header band; left of the label columns). These
-# match the freezes the writers already apply and never cross a merged header range.
-SAFE_VIEW_FREEZE = {
-    "Summary - Banks, ND & RIA": "C3",  # rows 1-2 (group + column headers) + label cols A,B
-    "Summary - FINTECH": "C3",
-    "SIP Pivot": "C6",                  # rows 1-5 (labels + pivot header) + key cols A,B
-    "Brokerwise Data": "G3",            # rows 1-2 (group + column headers) + label cols A-F
-}
-
-
-def apply_safe_excel_view(ws, freeze_cell=None, active_cell="A1"):
-    """Make a worksheet open cleanly near the top-left with a safe freeze pane.
+def apply_safe_excel_view(ws, active_cell="A1"):
+    """Make a worksheet open cleanly near the top-left with no frozen panes.
 
     View-only: resets the saved scroll position, active/selected cell, zoom and view
-    mode, (re)applies the freeze, and unhides any header rows above the freeze line.
+    mode and removes frozen panes.
     It never touches cell values, formulas, styles, merges, widths, or number formats.
-    Pass a ``freeze_cell`` that sits below every merged header range so the freeze
-    never splits a merged cell.
     """
     view = ws.sheet_view
     view.view = "normal"            # not pageBreakPreview / pageLayout
@@ -51,20 +46,14 @@ def apply_safe_excel_view(ws, freeze_cell=None, active_cell="A1"):
     view.zoomScaleNormal = None
     view.tabSelected = False         # the active sheet is set by apply_safe_workbook_views
     view.selection = [Selection(activeCell=active_cell, sqref=active_cell)]
-    if freeze_cell:
-        ws.freeze_panes = freeze_cell
-        freeze_row, _ = coordinate_to_tuple(freeze_cell)
-        for row in range(1, freeze_row):
-            dim = ws.row_dimensions.get(row)
-            if dim is not None and dim.hidden:
-                dim.hidden = False
+    ws.freeze_panes = None
 
 
 def apply_safe_workbook_views(workbook) -> None:
     """Reset every generated sheet to a clean, header-visible view and open the
     first sheet first. Safe to call after the workbook is fully built."""
     for index, ws in enumerate(workbook.worksheets):
-        apply_safe_excel_view(ws, freeze_cell=SAFE_VIEW_FREEZE.get(ws.title.strip()))
+        apply_safe_excel_view(ws)
         ws.sheet_view.tabSelected = index == 0
     workbook.active = 0
 
@@ -93,11 +82,16 @@ def _safe_cell_text(value: object) -> str:
 def build_summary_rows(
     frame: pd.DataFrame, scheme_master: list[dict], fintech: bool
 ) -> list[dict]:
+    """Build the primary overall summary or the separate FINTECH breakout.
+
+    The primary 45-scheme summary intentionally includes every brokerwise row,
+    including FINTECH, so its grand totals tie directly to Brokerwise Data.
+    """
     if frame.empty:
         selected = frame
     else:
         fintech_mask = frame.apply(is_fintech_row, axis=1)
-        selected = frame[fintech_mask if fintech else ~fintech_mask]
+        selected = frame[fintech_mask] if fintech else frame
 
     order_key = "display_order_fintech" if fintech else "display_order_banks_nd_ria"
     include_key = "include_in_fintech" if fintech else "include_in_banks_nd_ria"
@@ -136,9 +130,7 @@ def build_sip_pivot(frame: pd.DataFrame) -> list[dict]:
 
 def _sheet_by_trimmed_name(workbook, name: str):
     for worksheet in workbook.worksheets:
-        if worksheet.title.strip() == name:
-            if worksheet.title != name:
-                worksheet.title = name
+        if worksheet.title.strip() == name.strip():
             return worksheet
     raise ValueError(f"Template is missing sheet: {name}")
 
@@ -208,7 +200,6 @@ def _write_summary_sheet(worksheet, rows: list[dict]) -> None:
     for ms_column, _, _ in ms_columns:
         worksheet.column_dimensions[get_column_letter(ms_column)].width = 9
 
-    worksheet.freeze_panes = "C3"
     worksheet.auto_filter.ref = f"A2:Q{expected_last}"
 
 
@@ -303,76 +294,214 @@ def _write_brokerwise_sheet(worksheet, frame: pd.DataFrame) -> None:
         worksheet.column_dimensions[get_column_letter(ms_column)].width = 9
     worksheet.column_dimensions[get_column_letter(4)].width = 30
 
-    worksheet.freeze_panes = "G3"
     worksheet.auto_filter.ref = f"A2:U{last_data_row}" if len(frame) else "A2:U2"
 
 
-def _rebuild_sip_sheet(workbook, frame: pd.DataFrame) -> None:
-    old = _sheet_by_trimmed_name(workbook, "SIP Pivot")
-    index = workbook.index(old)
-    workbook.remove(old)
-    worksheet = workbook.create_sheet("SIP Pivot", index)
-    worksheet.sheet_view.showGridLines = False
-    worksheet.freeze_panes = "C6"
-    widths = {"A": 18, "B": 24, "C": 18, "D": 18}
-    for column, width in widths.items():
-        worksheet.column_dimensions[column].width = width
+def _configure_sip_pivot(workbook, data_row_count: int) -> None:
+    """Keep the template PivotTable and point its cache at this week's data."""
+    worksheet = _sheet_by_trimmed_name(workbook, "SIP Pivot")
+    if len(worksheet._pivots) != 1:
+        raise ValueError(
+            "Template SIP Pivot must contain exactly one native Excel PivotTable"
+        )
+    pivot = worksheet._pivots[0]
+    cache = pivot.cache
+    source = cache.cacheSource.worksheetSource
+    if source is None:
+        raise ValueError("Template SIP Pivot cache has no worksheet source")
+    source.sheet = _sheet_by_trimmed_name(workbook, "Brokerwise Data").title
+    source.ref = f"A2:U{max(2, data_row_count + 2)}"
+    # Keep this off during the headless formula-cache pass. It is enabled in the
+    # final package XML afterwards, otherwise Excel begins an asynchronous pivot
+    # refresh immediately and rejects calculation/save automation calls.
+    cache.refreshOnLoad = False
+    cache.enableRefresh = True
+    cache.recordCount = data_row_count
 
-    thin = Side(style="thin", color="FFB7C9D6")
-    blue = PatternFill("solid", fgColor="FFB7E1F2")
-    header = PatternFill("solid", fgColor="FF92D4EA")
-    total_fill = PatternFill("solid", fgColor="FFD9D9D9")
-    for row, label, value in ((1, "CATEGORY", "ALL"), (2, "SUB-CATEGORY", "ALL")):
-        worksheet.cell(row, 1, label)
-        worksheet.cell(row, 2, value)
-        for column in range(1, 5):
-            worksheet.cell(row, column).fill = blue
-            worksheet.cell(row, column).font = Font(name="Arial", size=9, bold=column == 1)
 
-    headers = ["ARN-CODE", "BROKER NAME", "Sum of KOTAK - SIP COUNT", "Sum of CAMS - SIP COUNT"]
-    for column, value in enumerate(headers, start=1):
-        cell = worksheet.cell(5, column, value)
-        cell.fill = header
-        cell.font = Font(name="Arial", size=9, bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
-    worksheet.row_dimensions[5].height = 36
+def _recalculate_with_excel(path: Path) -> None:
+    """Use installed Excel as the headless calculation engine.
 
-    pivot = build_sip_pivot(frame)
-    for row_number, record in enumerate(pivot, start=6):
-        values = [
-            record["arn_code"],
-            record["broker_name"],
-            record["kotak_sip_count"],
-            record["cams_sip_count"],
-        ]
-        for column, value in enumerate(values, start=1):
-            safe_value = _safe_cell_text(value) if column <= 2 else value
-            cell = worksheet.cell(row_number, column, safe_value)
-            cell.fill = blue
-            cell.font = Font(name="Arial", size=9)
-            cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
-            if column > 2:
-                cell.number_format = COUNT_FMT
+    openpyxl intentionally does not evaluate formulas. Excel automation is the
+    local equivalent of a LibreOffice headless recalc and preserves native Excel
+    PivotTables while writing formula results into the workbook cache.
+    """
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:  # pragma: no cover - depends on deployment host
+        raise RuntimeError(
+            "Workbook recalculation requires Microsoft Excel automation or a "
+            "LibreOffice headless runtime; no recalculation engine is available"
+        )
+    script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class ExcelProcessId {
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}
+'@
+$excel = $null
+$book = $null
+$excelPid = 0
+$failure = $null
+try {
+  $excel = New-Object -ComObject Excel.Application
+  [void][ExcelProcessId]::GetWindowThreadProcessId([IntPtr]$excel.Hwnd, [ref]$excelPid)
+  $excel.Visible = $false
+  $excel.DisplayAlerts = $false
+  $excel.AskToUpdateLinks = $false
+  $book = $excel.Workbooks.Open($env:MIS_RECALC_PATH, 0, $false)
+  $excel.CalculateFullRebuild()
+  $book.Save()
+  Start-Sleep -Seconds 1
+} catch {
+  $failure = $_.Exception.Message
+} finally {
+  if ($null -ne $book) {
+    try { $book.Close($false) } catch { }
+    try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) } catch { }
+  }
+  if ($null -ne $excel) {
+    try { $excel.Quit() } catch { }
+    try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) } catch { }
+  }
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
+  if ($excelPid -gt 0) {
+    Start-Sleep -Milliseconds 250
+    Get-Process -Id $excelPid -ErrorAction SilentlyContinue |
+      Stop-Process -Force -ErrorAction SilentlyContinue
+  }
+}
+if ($null -ne $failure) { [Console]::Error.WriteLine($failure); exit 1 }
+exit 0
+"""
+    environment = os.environ.copy()
+    environment["MIS_RECALC_PATH"] = str(path.resolve())
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=environment,
+        check=False,
+    )
+    if result.returncode:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Excel failed to recalculate generated workbook {path}: {details}")
 
-    total_row = 6 + len(pivot)
-    worksheet.cell(total_row, 1, "Grand Total")
-    worksheet.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=2)
-    for column in range(1, 5):
-        cell = worksheet.cell(total_row, column)
-        cell.fill = total_fill
-        cell.font = Font(name="Arial", size=9, bold=True)
-        cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
-    worksheet.cell(total_row, 1).alignment = Alignment(horizontal="center")
-    if pivot:
-        worksheet.cell(total_row, 3, f"=SUBTOTAL(9,C6:C{total_row - 1})")
-        worksheet.cell(total_row, 4, f"=SUBTOTAL(9,D6:D{total_row - 1})")
-    else:
-        worksheet.cell(total_row, 3, 0)
-        worksheet.cell(total_row, 4, 0)
-    worksheet.cell(total_row, 3).number_format = COUNT_FMT
-    worksheet.cell(total_row, 4).number_format = COUNT_FMT
-    worksheet.auto_filter.ref = f"A5:D{max(total_row - 1, 5)}"
+
+def _force_recalculation_properties(path: Path) -> None:
+    """Restore explicit calcPr and pivot-refresh flags after cache calculation.
+
+    Excel omits ``calcMode=auto`` because auto is its default. Updating only the
+    package XML after calculation retains the cached values that openpyxl would
+    otherwise discard on a second save.
+    """
+    with tempfile.NamedTemporaryFile(
+        prefix=path.stem + "_", suffix=".xlsx", dir=path.parent, delete=False
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        with ZipFile(path, "r") as source, ZipFile(
+            temporary_path, "w", compression=ZIP_DEFLATED
+        ) as destination:
+            for item in source.infolist():
+                data = source.read(item.filename)
+                if item.filename == "xl/workbook.xml":
+                    xml = data.decode("utf-8")
+                    match = re.search(r"<calcPr\b[^>]*/?>", xml)
+                    if match is None:
+                        tag = '<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>'
+                        xml = xml.replace("</workbook>", tag + "</workbook>")
+                    else:
+                        tag = match.group(0)
+                        for attribute, value in (
+                            ("calcMode", "auto"),
+                            ("fullCalcOnLoad", "1"),
+                            ("forceFullCalc", "1"),
+                        ):
+                            pattern = rf'\s{attribute}="[^"]*"'
+                            replacement = f' {attribute}="{value}"'
+                            if re.search(pattern, tag):
+                                tag = re.sub(pattern, replacement, tag)
+                            else:
+                                if tag.endswith("/>"):
+                                    tag = tag[:-2] + replacement + "/>"
+                                else:
+                                    tag = tag[:-1] + replacement + ">"
+                        xml = xml[: match.start()] + tag + xml[match.end() :]
+                    data = xml.encode("utf-8")
+                elif item.filename.startswith(
+                    "xl/pivotCache/pivotCacheDefinition"
+                ) and item.filename.endswith(".xml"):
+                    xml = data.decode("utf-8")
+                    match = re.search(r"<pivotCacheDefinition\b[^>]*>", xml)
+                    if match is None:
+                        raise ValueError(f"Invalid pivot cache definition: {item.filename}")
+                    tag = match.group(0)
+                    for attribute, value in (
+                        ("refreshOnLoad", "1"),
+                        ("enableRefresh", "1"),
+                    ):
+                        pattern = rf'\s{attribute}="[^"]*"'
+                        replacement = f' {attribute}="{value}"'
+                        if re.search(pattern, tag):
+                            tag = re.sub(pattern, replacement, tag)
+                        else:
+                            tag = tag[:-1] + replacement + ">"
+                    xml = xml[: match.start()] + tag + xml[match.end() :]
+                    data = xml.encode("utf-8")
+                destination.writestr(item, data)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _assert_recalculated_workbook(
+    path: Path, expected_kotak_aum: float, total_row: int
+) -> None:
+    formula_workbook = load_workbook(path, read_only=False, data_only=False)
+    workbook = load_workbook(path, read_only=False, data_only=True)
+    try:
+        errors: list[str] = []
+        missing_caches: list[str] = []
+        for worksheet in workbook.worksheets:
+            formula_sheet = formula_workbook[worksheet.title]
+            for row in worksheet.iter_rows():
+                for cell in row:
+                    value = cell.value
+                    if isinstance(value, str) and value.upper() in FORMULA_ERRORS:
+                        errors.append(f"{worksheet.title}!{cell.coordinate}={value}")
+                    formula = formula_sheet[cell.coordinate].value
+                    if isinstance(formula, str) and formula.startswith("=") and value is None:
+                        missing_caches.append(f"{worksheet.title}!{cell.coordinate}")
+        if errors:
+            raise ValueError("Generated workbook contains formula errors: " + ", ".join(errors))
+        if missing_caches:
+            raise ValueError(
+                "Generated workbook contains formulas without cached values: "
+                + ", ".join(missing_caches)
+            )
+
+        pivot_sheet = _sheet_by_trimmed_name(formula_workbook, "SIP Pivot")
+        if len(pivot_sheet._pivots) != 1 or not pivot_sheet._pivots[0].cache.refreshOnLoad:
+            raise ValueError("Generated workbook lost its refreshable native SIP PivotTable")
+
+        brokerwise = _sheet_by_trimmed_name(workbook, "Brokerwise Data")
+        cached_total = brokerwise.cell(total_row, 7).value
+        if not isinstance(cached_total, (int, float)) or not math.isclose(
+            float(cached_total), float(expected_kotak_aum), rel_tol=1e-9, abs_tol=0.01
+        ):
+            raise ValueError(
+                "Generated workbook was not recalculated: Brokerwise Grand Total AUM "
+                f"cache is {cached_total!r}, expected {expected_kotak_aum:.2f}"
+            )
+    finally:
+        workbook.close()
+        formula_workbook.close()
 
 
 def generate_weekly_summary(
@@ -382,12 +511,12 @@ def generate_weekly_summary(
     output_path: Path,
 ) -> None:
     workbook = load_workbook(template_path)
-    banks = build_summary_rows(frame, scheme_master, fintech=False)
+    overall = build_summary_rows(frame, scheme_master, fintech=False)
     fintech = build_summary_rows(frame, scheme_master, fintech=True)
-    _write_summary_sheet(_sheet_by_trimmed_name(workbook, EXPECTED_SHEETS[0]), banks)
+    _write_summary_sheet(_sheet_by_trimmed_name(workbook, EXPECTED_SHEETS[0]), overall)
     _write_summary_sheet(_sheet_by_trimmed_name(workbook, EXPECTED_SHEETS[1]), fintech)
-    _rebuild_sip_sheet(workbook, frame)
     _write_brokerwise_sheet(_sheet_by_trimmed_name(workbook, EXPECTED_SHEETS[3]), frame)
+    _configure_sip_pivot(workbook, len(frame))
     # Open every sheet at a clean, header-visible view and land on the first sheet.
     apply_safe_workbook_views(workbook)
     workbook.calculation.fullCalcOnLoad = True
@@ -396,12 +525,19 @@ def generate_weekly_summary(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output_path)
     validate_generated_workbook(output_path)
+    _recalculate_with_excel(output_path)
+    _force_recalculation_properties(output_path)
+    _assert_recalculated_workbook(
+        output_path,
+        expected_kotak_aum=float(frame["kotak_aum"].sum()) if not frame.empty else 0.0,
+        total_row=4 + len(frame),
+    )
 
 
 def validate_generated_workbook(path: Path) -> None:
     workbook = load_workbook(path, read_only=False, data_only=False)
     try:
-        names = [name.strip() for name in workbook.sheetnames]
+        names = workbook.sheetnames
         if names != EXPECTED_SHEETS:
             raise ValueError(f"Generated sheet order is invalid: {names}")
         bank = _sheet_by_trimmed_name(workbook, EXPECTED_SHEETS[0])
@@ -410,6 +546,8 @@ def validate_generated_workbook(path: Path) -> None:
             raise ValueError("Generated summary row counts do not match the template contract")
         if not str(bank["E3"].value).startswith("=IFERROR"):
             raise ValueError("Generated market-share formulas are missing")
+        pivot_sheet = _sheet_by_trimmed_name(workbook, "SIP Pivot")
+        if len(pivot_sheet._pivots) != 1:
+            raise ValueError("Generated workbook lost the native SIP PivotTable")
     finally:
         workbook.close()
-
